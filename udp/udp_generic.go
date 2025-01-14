@@ -11,6 +11,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"net/netip"
 
 	"github.com/sirupsen/logrus"
 	"github.com/slackhq/nebula/config"
@@ -18,48 +19,51 @@ import (
 	"github.com/slackhq/nebula/header"
 )
 
-type Conn struct {
+type GenericConn struct {
 	*net.UDPConn
 	l *logrus.Logger
 }
 
-func NewListener(l *logrus.Logger, ip string, port int, multi bool, batch int) (*Conn, error) {
+var _ Conn = &GenericConn{}
+
+func NewGenericListener(l *logrus.Logger, ip netip.Addr, port int, multi bool, batch int) (Conn, error) {
 	lc := NewListenConfig(multi)
-	pc, err := lc.ListenPacket(context.TODO(), "udp", fmt.Sprintf("%s:%d", ip, port))
+	pc, err := lc.ListenPacket(context.TODO(), "udp", net.JoinHostPort(ip.String(), fmt.Sprintf("%v", port)))
 	if err != nil {
 		return nil, err
 	}
 	if uc, ok := pc.(*net.UDPConn); ok {
-		return &Conn{UDPConn: uc, l: l}, nil
+		return &GenericConn{UDPConn: uc, l: l}, nil
 	}
 	return nil, fmt.Errorf("Unexpected PacketConn: %T %#v", pc, pc)
 }
 
-func (uc *Conn) WriteTo(b []byte, addr *Addr) error {
-	_, err := uc.UDPConn.WriteToUDP(b, &net.UDPAddr{IP: addr.IP, Port: int(addr.Port)})
+func (u *GenericConn) WriteTo(b []byte, addr netip.AddrPort) error {
+	_, err := u.UDPConn.WriteToUDPAddrPort(b, addr)
 	return err
 }
 
-func (uc *Conn) LocalAddr() (*Addr, error) {
-	a := uc.UDPConn.LocalAddr()
+func (u *GenericConn) LocalAddr() (netip.AddrPort, error) {
+	a := u.UDPConn.LocalAddr()
 
 	switch v := a.(type) {
 	case *net.UDPAddr:
-		addr := &Addr{IP: make([]byte, len(v.IP))}
-		copy(addr.IP, v.IP)
-		addr.Port = uint16(v.Port)
-		return addr, nil
+		addr, ok := netip.AddrFromSlice(v.IP)
+		if !ok {
+			return netip.AddrPort{}, fmt.Errorf("LocalAddr returned invalid IP address: %s", v.IP)
+		}
+		return netip.AddrPortFrom(addr, uint16(v.Port)), nil
 
 	default:
-		return nil, fmt.Errorf("LocalAddr returned: %#v", a)
+		return netip.AddrPort{}, fmt.Errorf("LocalAddr returned: %#v", a)
 	}
 }
 
-func (u *Conn) ReloadConfig(c *config.C) {
+func (u *GenericConn) ReloadConfig(c *config.C) {
 	// TODO
 }
 
-func NewUDPStatsEmitter(udpConns []*Conn) func() {
+func NewUDPStatsEmitter(udpConns []Conn) func() {
 	// No UDP stats for non-linux
 	return func() {}
 }
@@ -68,24 +72,31 @@ type rawMessage struct {
 	Len uint32
 }
 
-func (u *Conn) ListenOut(r EncReader, lhf LightHouseHandlerFunc, cache *firewall.ConntrackCacheTicker, q int) {
+func (u *GenericConn) ListenOut(r EncReader, lhf LightHouseHandlerFunc, cache *firewall.ConntrackCacheTicker, q int) {
 	plaintext := make([]byte, MTU)
 	buffer := make([]byte, MTU)
 	h := &header.H{}
 	fwPacket := &firewall.Packet{}
-	udpAddr := &Addr{IP: make([]byte, 16)}
 	nb := make([]byte, 12, 12)
 
 	for {
 		// Just read one packet at a time
-		n, rua, err := u.ReadFromUDP(buffer)
+		n, rua, err := u.ReadFromUDPAddrPort(buffer)
 		if err != nil {
-			u.l.WithError(err).Error("Failed to read packets")
-			continue
+			u.l.WithError(err).Debug("udp socket is closed, exiting read loop")
+			return
 		}
 
-		udpAddr.IP = rua.IP
-		udpAddr.Port = uint16(rua.Port)
-		r(udpAddr, nil, plaintext[:0], buffer[:n], h, fwPacket, lhf, nb, q, cache.Get(u.l))
+		r(
+			netip.AddrPortFrom(rua.Addr().Unmap(), rua.Port()),
+			plaintext[:0],
+			buffer[:n],
+			h,
+			fwPacket,
+			lhf,
+			nb,
+			q,
+			cache.Get(u.l),
+		)
 	}
 }

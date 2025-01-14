@@ -1,22 +1,24 @@
 package config
 
 import (
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
+	"dario.cat/mergo"
 	"github.com/slackhq/nebula/test"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"gopkg.in/yaml.v2"
 )
 
 func TestConfig_Load(t *testing.T) {
 	l := test.NewLogger()
-	dir, err := ioutil.TempDir("", "config-test")
+	dir, err := os.MkdirTemp("", "config-test")
 	// invalid yaml
 	c := NewC(l)
-	ioutil.WriteFile(filepath.Join(dir, "01.yaml"), []byte(" invalid yaml"), 0644)
+	os.WriteFile(filepath.Join(dir, "01.yaml"), []byte(" invalid yaml"), 0644)
 	assert.EqualError(t, c.Load(dir), "yaml: unmarshal errors:\n  line 1: cannot unmarshal !!str `invalid...` into map[interface {}]interface {}")
 
 	// simple multi config merge
@@ -26,8 +28,8 @@ func TestConfig_Load(t *testing.T) {
 
 	assert.Nil(t, err)
 
-	ioutil.WriteFile(filepath.Join(dir, "01.yaml"), []byte("outer:\n  inner: hi"), 0644)
-	ioutil.WriteFile(filepath.Join(dir, "02.yml"), []byte("outer:\n  inner: override\nnew: hi"), 0644)
+	os.WriteFile(filepath.Join(dir, "01.yaml"), []byte("outer:\n  inner: hi"), 0644)
+	os.WriteFile(filepath.Join(dir, "02.yml"), []byte("outer:\n  inner: override\nnew: hi"), 0644)
 	assert.Nil(t, c.Load(dir))
 	expected := map[interface{}]interface{}{
 		"outer": map[interface{}]interface{}{
@@ -117,9 +119,9 @@ func TestConfig_HasChanged(t *testing.T) {
 func TestConfig_ReloadConfig(t *testing.T) {
 	l := test.NewLogger()
 	done := make(chan bool, 1)
-	dir, err := ioutil.TempDir("", "config-test")
+	dir, err := os.MkdirTemp("", "config-test")
 	assert.Nil(t, err)
-	ioutil.WriteFile(filepath.Join(dir, "01.yaml"), []byte("outer:\n  inner: hi"), 0644)
+	os.WriteFile(filepath.Join(dir, "01.yaml"), []byte("outer:\n  inner: hi"), 0644)
 
 	c := NewC(l)
 	assert.Nil(t, c.Load(dir))
@@ -128,7 +130,7 @@ func TestConfig_ReloadConfig(t *testing.T) {
 	assert.False(t, c.HasChanged("outer"))
 	assert.False(t, c.HasChanged(""))
 
-	ioutil.WriteFile(filepath.Join(dir, "01.yaml"), []byte("outer:\n  inner: ho"), 0644)
+	os.WriteFile(filepath.Join(dir, "01.yaml"), []byte("outer:\n  inner: ho"), 0644)
 
 	c.RegisterReloadCallback(func(c *C) {
 		done <- true
@@ -146,4 +148,78 @@ func TestConfig_ReloadConfig(t *testing.T) {
 		panic("timeout")
 	}
 
+}
+
+// Ensure mergo merges are done the way we expect.
+// This is needed to test for potential regressions, like:
+// - https://github.com/imdario/mergo/issues/187
+func TestConfig_MergoMerge(t *testing.T) {
+	configs := [][]byte{
+		[]byte(`
+listen:
+  port: 1234
+`),
+		[]byte(`
+firewall:
+  inbound:
+    - port: 443
+      proto: tcp
+      groups:
+        - server
+    - port: 443
+      proto: tcp
+      groups:
+        - webapp
+`),
+		[]byte(`
+listen:
+  host: 0.0.0.0
+  port: 4242
+firewall:
+  outbound:
+    - port: any
+      proto: any
+      host: any
+  inbound:
+    - port: any
+      proto: icmp
+      host: any
+`),
+	}
+
+	var m map[any]any
+
+	// merge the same way config.parse() merges
+	for _, b := range configs {
+		var nm map[any]any
+		err := yaml.Unmarshal(b, &nm)
+		require.NoError(t, err)
+
+		// We need to use WithAppendSlice so that firewall rules in separate
+		// files are appended together
+		err = mergo.Merge(&nm, m, mergo.WithAppendSlice)
+		m = nm
+		require.NoError(t, err)
+	}
+
+	t.Logf("Merged Config: %#v", m)
+	mYaml, err := yaml.Marshal(m)
+	require.NoError(t, err)
+	t.Logf("Merged Config as YAML:\n%s", mYaml)
+
+	// If a bug is present, some items might be replaced instead of merged like we expect
+	expected := map[any]any{
+		"firewall": map[any]any{
+			"inbound": []any{
+				map[any]any{"host": "any", "port": "any", "proto": "icmp"},
+				map[any]any{"groups": []any{"server"}, "port": 443, "proto": "tcp"},
+				map[any]any{"groups": []any{"webapp"}, "port": 443, "proto": "tcp"}},
+			"outbound": []any{
+				map[any]any{"host": "any", "port": "any", "proto": "any"}}},
+		"listen": map[any]any{
+			"host": "0.0.0.0",
+			"port": 4242,
+		},
+	}
+	assert.Equal(t, expected, m)
 }

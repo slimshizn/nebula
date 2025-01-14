@@ -6,10 +6,16 @@ package udp
 import (
 	"fmt"
 	"net"
+	"net/netip"
 	"syscall"
 
+	"github.com/sirupsen/logrus"
 	"golang.org/x/sys/unix"
 )
+
+func NewListener(l *logrus.Logger, ip netip.Addr, port int, multi bool, batch int) (Conn, error) {
+	return NewGenericListener(l, ip, port, multi, batch)
+}
 
 func NewListenConfig(multi bool) net.ListenConfig {
 	return net.ListenConfig{
@@ -34,6 +40,6 @@ func NewListenConfig(multi bool) net.ListenConfig {
 	}
 }
 
-func (u *Conn) Rebind() error {
+func (u *GenericConn) Rebind() error {
 	return nil
 }

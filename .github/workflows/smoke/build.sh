@@ -11,6 +11,11 @@ mkdir ./build
     cp ../../../../build/linux-amd64/nebula .
     cp ../../../../build/linux-amd64/nebula-cert .
 
+    if [ "$1" ]
+    then
+        cp "../../../../build/$1/nebula" "$1-nebula"
+    fi
+
     HOST="lighthouse1" \
         AM_LIGHTHOUSE=true \
         ../genconfig.sh >lighthouse1.yml
@@ -29,11 +34,11 @@ mkdir ./build
         OUTBOUND='[{"port": "any", "proto": "icmp", "group": "lighthouse"}]' \
         ../genconfig.sh >host4.yml
 
-    ../../../../nebula-cert ca -name "Smoke Test"
+    ../../../../nebula-cert ca -curve "${CURVE:-25519}" -name "Smoke Test"
     ../../../../nebula-cert sign -name "lighthouse1" -groups "lighthouse,lighthouse1" -ip "192.168.100.1/24"
     ../../../../nebula-cert sign -name "host2" -groups "host,host2" -ip "192.168.100.2/24"
     ../../../../nebula-cert sign -name "host3" -groups "host,host3" -ip "192.168.100.3/24"
     ../../../../nebula-cert sign -name "host4" -groups "host,host4" -ip "192.168.100.4/24"
 )
 
-sudo docker build -t nebula:smoke .
+docker build -t "nebula:${NAME:-smoke}" .

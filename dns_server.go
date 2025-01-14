@@ -3,13 +3,14 @@ package nebula
 import (
 	"fmt"
 	"net"
+	"net/netip"
 	"strconv"
+	"strings"
 	"sync"
 
 	"github.com/miekg/dns"
 	"github.com/sirupsen/logrus"
 	"github.com/slackhq/nebula/config"
-	"github.com/slackhq/nebula/iputil"
 )
 
 // This whole thing should be rewritten to use context
@@ -33,37 +34,40 @@ func newDnsRecords(hostMap *HostMap) *dnsRecords {
 
 func (d *dnsRecords) Query(data string) string {
 	d.RLock()
-	if r, ok := d.dnsMap[data]; ok {
-		d.RUnlock()
+	defer d.RUnlock()
+	if r, ok := d.dnsMap[strings.ToLower(data)]; ok {
 		return r
 	}
-	d.RUnlock()
 	return ""
 }
 
 func (d *dnsRecords) QueryCert(data string) string {
-	ip := net.ParseIP(data[:len(data)-1])
-	if ip == nil {
-		return ""
-	}
-	iip := iputil.Ip2VpnIp(ip)
-	hostinfo, err := d.hostMap.QueryVpnIp(iip)
+	ip, err := netip.ParseAddr(data[:len(data)-1])
 	if err != nil {
 		return ""
 	}
+
+	hostinfo := d.hostMap.QueryVpnIp(ip)
+	if hostinfo == nil {
+		return ""
+	}
+
 	q := hostinfo.GetCert()
 	if q == nil {
 		return ""
 	}
-	cert := q.Details
-	c := fmt.Sprintf("\"Name: %s\" \"Ips: %s\" \"Subnets %s\" \"Groups %s\" \"NotBefore %s\" \"NotAFter %s\" \"PublicKey %x\" \"IsCA %t\" \"Issuer %s\"", cert.Name, cert.Ips, cert.Subnets, cert.Groups, cert.NotBefore, cert.NotAfter, cert.PublicKey, cert.IsCA, cert.Issuer)
-	return c
+
+	b, err := q.Certificate.MarshalJSON()
+	if err != nil {
+		return ""
+	}
+	return string(b)
 }
 
 func (d *dnsRecords) Add(host, data string) {
 	d.Lock()
-	d.dnsMap[host] = data
-	d.Unlock()
+	defer d.Unlock()
+	d.dnsMap[strings.ToLower(host)] = data
 }
 
 func parseQuery(l *logrus.Logger, m *dns.Msg, w dns.ResponseWriter) {
@@ -80,7 +84,11 @@ func parseQuery(l *logrus.Logger, m *dns.Msg, w dns.ResponseWriter) {
 			}
 		case dns.TypeTXT:
 			a, _, _ := net.SplitHostPort(w.RemoteAddr().String())
-			b := net.ParseIP(a)
+			b, err := netip.ParseAddr(a)
+			if err != nil {
+				return
+			}
+
 			// We don't answer these queries from non nebula nodes or localhost
 			//l.Debugf("Does %s contain %s", b, dnsR.hostMap.vpnCIDR)
 			if !dnsR.hostMap.vpnCIDR.Contains(b) && a != "127.0.0.1" {
@@ -95,6 +103,10 @@ func parseQuery(l *logrus.Logger, m *dns.Msg, w dns.ResponseWriter) {
 				}
 			}
 		}
+	}
+
+	if len(m.Answer) == 0 {
+		m.Rcode = dns.RcodeNameError
 	}
 }
 
@@ -129,7 +141,12 @@ func dnsMain(l *logrus.Logger, hostMap *HostMap, c *config.C) func() {
 }
 
 func getDnsServerAddr(c *config.C) string {
-	return c.GetString("lighthouse.dns.host", "") + ":" + strconv.Itoa(c.GetInt("lighthouse.dns.port", 53))
+	dnsHost := strings.TrimSpace(c.GetString("lighthouse.dns.host", ""))
+	// Old guidance was to provide the literal `[::]` in `lighthouse.dns.host` but that won't resolve.
+	if dnsHost == "[::]" {
+		dnsHost = "::"
+	}
+	return net.JoinHostPort(dnsHost, strconv.Itoa(c.GetInt("lighthouse.dns.port", 53)))
 }
 
 func startDns(l *logrus.Logger, c *config.C) {
