@@ -7,47 +7,38 @@ import (
 	"encoding/binary"
 	"fmt"
 	"net"
+	"net/netip"
 	"syscall"
 	"unsafe"
 
 	"github.com/rcrowley/go-metrics"
 	"github.com/sirupsen/logrus"
 	"github.com/slackhq/nebula/config"
-	"github.com/slackhq/nebula/firewall"
-	"github.com/slackhq/nebula/header"
 	"golang.org/x/sys/unix"
 )
 
-//TODO: make it support reload as best you can!
-
-type Conn struct {
+type StdConn struct {
 	sysFd int
+	isV4  bool
 	l     *logrus.Logger
 	batch int
 }
 
-var x int
+func maybeIPV4(ip net.IP) (net.IP, bool) {
+	ip4 := ip.To4()
+	if ip4 != nil {
+		return ip4, true
+	}
+	return ip, false
+}
 
-// From linux/sock_diag.h
-const (
-	_SK_MEMINFO_RMEM_ALLOC = iota
-	_SK_MEMINFO_RCVBUF
-	_SK_MEMINFO_WMEM_ALLOC
-	_SK_MEMINFO_SNDBUF
-	_SK_MEMINFO_FWD_ALLOC
-	_SK_MEMINFO_WMEM_QUEUED
-	_SK_MEMINFO_OPTMEM
-	_SK_MEMINFO_BACKLOG
-	_SK_MEMINFO_DROPS
-
-	_SK_MEMINFO_VARS
-)
-
-type _SK_MEMINFO [_SK_MEMINFO_VARS]uint32
-
-func NewListener(l *logrus.Logger, ip string, port int, multi bool, batch int) (*Conn, error) {
+func NewListener(l *logrus.Logger, ip netip.Addr, port int, multi bool, batch int) (Conn, error) {
+	af := unix.AF_INET6
+	if ip.Is4() {
+		af = unix.AF_INET
+	}
 	syscall.ForkLock.RLock()
-	fd, err := unix.Socket(unix.AF_INET6, unix.SOCK_DGRAM, unix.IPPROTO_UDP)
+	fd, err := unix.Socket(af, unix.SOCK_DGRAM, unix.IPPROTO_UDP)
 	if err == nil {
 		unix.CloseOnExec(fd)
 	}
@@ -58,76 +49,70 @@ func NewListener(l *logrus.Logger, ip string, port int, multi bool, batch int) (
 		return nil, fmt.Errorf("unable to open socket: %s", err)
 	}
 
-	var lip [16]byte
-	copy(lip[:], net.ParseIP(ip))
-
 	if multi {
 		if err = unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_REUSEPORT, 1); err != nil {
 			return nil, fmt.Errorf("unable to set SO_REUSEPORT: %s", err)
 		}
 	}
 
-	//TODO: support multiple listening IPs (for limiting ipv6)
-	if err = unix.Bind(fd, &unix.SockaddrInet6{Addr: lip, Port: port}); err != nil {
+	var sa unix.Sockaddr
+	if ip.Is4() {
+		sa4 := &unix.SockaddrInet4{Port: port}
+		sa4.Addr = ip.As4()
+		sa = sa4
+	} else {
+		sa6 := &unix.SockaddrInet6{Port: port}
+		sa6.Addr = ip.As16()
+		sa = sa6
+	}
+	if err = unix.Bind(fd, sa); err != nil {
 		return nil, fmt.Errorf("unable to bind to socket: %s", err)
 	}
 
-	//TODO: this may be useful for forcing threads into specific cores
-	//unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_INCOMING_CPU, x)
-	//v, err := unix.GetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_INCOMING_CPU)
-	//l.Println(v, err)
-
-	return &Conn{sysFd: fd, l: l, batch: batch}, err
+	return &StdConn{sysFd: fd, isV4: ip.Is4(), l: l, batch: batch}, err
 }
 
-func (u *Conn) Rebind() error {
+func (u *StdConn) Rebind() error {
 	return nil
 }
 
-func (u *Conn) SetRecvBuffer(n int) error {
+func (u *StdConn) SetRecvBuffer(n int) error {
 	return unix.SetsockoptInt(u.sysFd, unix.SOL_SOCKET, unix.SO_RCVBUFFORCE, n)
 }
 
-func (u *Conn) SetSendBuffer(n int) error {
+func (u *StdConn) SetSendBuffer(n int) error {
 	return unix.SetsockoptInt(u.sysFd, unix.SOL_SOCKET, unix.SO_SNDBUFFORCE, n)
 }
 
-func (u *Conn) GetRecvBuffer() (int, error) {
+func (u *StdConn) GetRecvBuffer() (int, error) {
 	return unix.GetsockoptInt(int(u.sysFd), unix.SOL_SOCKET, unix.SO_RCVBUF)
 }
 
-func (u *Conn) GetSendBuffer() (int, error) {
+func (u *StdConn) GetSendBuffer() (int, error) {
 	return unix.GetsockoptInt(int(u.sysFd), unix.SOL_SOCKET, unix.SO_SNDBUF)
 }
 
-func (u *Conn) LocalAddr() (*Addr, error) {
+func (u *StdConn) LocalAddr() (netip.AddrPort, error) {
 	sa, err := unix.Getsockname(u.sysFd)
 	if err != nil {
-		return nil, err
+		return netip.AddrPort{}, err
 	}
 
-	addr := &Addr{}
 	switch sa := sa.(type) {
 	case *unix.SockaddrInet4:
-		addr.IP = net.IP{sa.Addr[0], sa.Addr[1], sa.Addr[2], sa.Addr[3]}.To16()
-		addr.Port = uint16(sa.Port)
-	case *unix.SockaddrInet6:
-		addr.IP = sa.Addr[0:]
-		addr.Port = uint16(sa.Port)
-	}
+		return netip.AddrPortFrom(netip.AddrFrom4(sa.Addr), uint16(sa.Port)), nil
 
-	return addr, nil
+	case *unix.SockaddrInet6:
+		return netip.AddrPortFrom(netip.AddrFrom16(sa.Addr), uint16(sa.Port)), nil
+
+	default:
+		return netip.AddrPort{}, fmt.Errorf("unsupported sock type: %T", sa)
+	}
 }
 
-func (u *Conn) ListenOut(r EncReader, lhf LightHouseHandlerFunc, cache *firewall.ConntrackCacheTicker, q int) {
-	plaintext := make([]byte, MTU)
-	h := &header.H{}
-	fwPacket := &firewall.Packet{}
-	udpAddr := &Addr{}
-	nb := make([]byte, 12, 12)
+func (u *StdConn) ListenOut(r EncReader) {
+	var ip netip.Addr
 
-	//TODO: should we track this?
-	//metric := metrics.GetOrRegisterHistogram("test.batch_read", nil, metrics.NewExpDecaySample(1028, 0.015))
 	msgs, buffers, names := u.PrepareRawMessages(u.batch)
 	read := u.ReadMulti
 	if u.batch == 1 {
@@ -137,20 +122,23 @@ func (u *Conn) ListenOut(r EncReader, lhf LightHouseHandlerFunc, cache *firewall
 	for {
 		n, err := read(msgs)
 		if err != nil {
-			u.l.WithError(err).Error("Failed to read packets")
-			continue
+			u.l.WithError(err).Debug("udp socket is closed, exiting read loop")
+			return
 		}
 
-		//metric.Update(int64(n))
 		for i := 0; i < n; i++ {
-			udpAddr.IP = names[i][8:24]
-			udpAddr.Port = binary.BigEndian.Uint16(names[i][2:4])
-			r(udpAddr, nil, plaintext[:0], buffers[i][:msgs[i].Len], h, fwPacket, lhf, nb, q, cache.Get(u.l))
+			// Its ok to skip the ok check here, the slicing is the only error that can occur and it will panic
+			if u.isV4 {
+				ip, _ = netip.AddrFromSlice(names[i][4:8])
+			} else {
+				ip, _ = netip.AddrFromSlice(names[i][8:24])
+			}
+			r(netip.AddrPortFrom(ip.Unmap(), binary.BigEndian.Uint16(names[i][2:4])), buffers[i][:msgs[i].Len])
 		}
 	}
 }
 
-func (u *Conn) ReadSingle(msgs []rawMessage) (int, error) {
+func (u *StdConn) ReadSingle(msgs []rawMessage) (int, error) {
 	for {
 		n, _, err := unix.Syscall6(
 			unix.SYS_RECVMSG,
@@ -171,7 +159,7 @@ func (u *Conn) ReadSingle(msgs []rawMessage) (int, error) {
 	}
 }
 
-func (u *Conn) ReadMulti(msgs []rawMessage) (int, error) {
+func (u *StdConn) ReadMulti(msgs []rawMessage) (int, error) {
 	for {
 		n, _, err := unix.Syscall6(
 			unix.SYS_RECVMMSG,
@@ -191,14 +179,18 @@ func (u *Conn) ReadMulti(msgs []rawMessage) (int, error) {
 	}
 }
 
-func (u *Conn) WriteTo(b []byte, addr *Addr) error {
+func (u *StdConn) WriteTo(b []byte, ip netip.AddrPort) error {
+	if u.isV4 {
+		return u.writeTo4(b, ip)
+	}
+	return u.writeTo6(b, ip)
+}
 
+func (u *StdConn) writeTo6(b []byte, ip netip.AddrPort) error {
 	var rsa unix.RawSockaddrInet6
 	rsa.Family = unix.AF_INET6
-	p := (*[2]byte)(unsafe.Pointer(&rsa.Port))
-	p[0] = byte(addr.Port >> 8)
-	p[1] = byte(addr.Port)
-	copy(rsa.Addr[:], addr.IP)
+	rsa.Addr = ip.Addr().As16()
+	binary.BigEndian.PutUint16((*[2]byte)(unsafe.Pointer(&rsa.Port))[:], ip.Port())
 
 	for {
 		_, _, err := unix.Syscall6(
@@ -215,13 +207,40 @@ func (u *Conn) WriteTo(b []byte, addr *Addr) error {
 			return &net.OpError{Op: "sendto", Err: err}
 		}
 
-		//TODO: handle incomplete writes
+		return nil
+	}
+}
+
+func (u *StdConn) writeTo4(b []byte, ip netip.AddrPort) error {
+	if !ip.Addr().Is4() {
+		return fmt.Errorf("Listener is IPv4, but writing to IPv6 remote")
+	}
+
+	var rsa unix.RawSockaddrInet4
+	rsa.Family = unix.AF_INET
+	rsa.Addr = ip.Addr().As4()
+	binary.BigEndian.PutUint16((*[2]byte)(unsafe.Pointer(&rsa.Port))[:], ip.Port())
+
+	for {
+		_, _, err := unix.Syscall6(
+			unix.SYS_SENDTO,
+			uintptr(u.sysFd),
+			uintptr(unsafe.Pointer(&b[0])),
+			uintptr(len(b)),
+			uintptr(0),
+			uintptr(unsafe.Pointer(&rsa)),
+			uintptr(unix.SizeofSockaddrInet4),
+		)
+
+		if err != 0 {
+			return &net.OpError{Op: "sendto", Err: err}
+		}
 
 		return nil
 	}
 }
 
-func (u *Conn) ReloadConfig(c *config.C) {
+func (u *StdConn) ReloadConfig(c *config.C) {
 	b := c.GetInt("listen.read_buffer", 0)
 	if b > 0 {
 		err := u.SetRecvBuffer(b)
@@ -253,8 +272,8 @@ func (u *Conn) ReloadConfig(c *config.C) {
 	}
 }
 
-func (u *Conn) getMemInfo(meminfo *_SK_MEMINFO) error {
-	var vallen uint32 = 4 * _SK_MEMINFO_VARS
+func (u *StdConn) getMemInfo(meminfo *[unix.SK_MEMINFO_VARS]uint32) error {
+	var vallen uint32 = 4 * unix.SK_MEMINFO_VARS
 	_, _, err := unix.Syscall6(unix.SYS_GETSOCKOPT, uintptr(u.sysFd), uintptr(unix.SOL_SOCKET), uintptr(unix.SO_MEMINFO), uintptr(unsafe.Pointer(meminfo)), uintptr(unsafe.Pointer(&vallen)), 0)
 	if err != 0 {
 		return err
@@ -262,14 +281,18 @@ func (u *Conn) getMemInfo(meminfo *_SK_MEMINFO) error {
 	return nil
 }
 
-func NewUDPStatsEmitter(udpConns []*Conn) func() {
+func (u *StdConn) Close() error {
+	return syscall.Close(u.sysFd)
+}
+
+func NewUDPStatsEmitter(udpConns []Conn) func() {
 	// Check if our kernel supports SO_MEMINFO before registering the gauges
-	var udpGauges [][_SK_MEMINFO_VARS]metrics.Gauge
-	var meminfo _SK_MEMINFO
-	if err := udpConns[0].getMemInfo(&meminfo); err == nil {
-		udpGauges = make([][_SK_MEMINFO_VARS]metrics.Gauge, len(udpConns))
+	var udpGauges [][unix.SK_MEMINFO_VARS]metrics.Gauge
+	var meminfo [unix.SK_MEMINFO_VARS]uint32
+	if err := udpConns[0].(*StdConn).getMemInfo(&meminfo); err == nil {
+		udpGauges = make([][unix.SK_MEMINFO_VARS]metrics.Gauge, len(udpConns))
 		for i := range udpConns {
-			udpGauges[i] = [_SK_MEMINFO_VARS]metrics.Gauge{
+			udpGauges[i] = [unix.SK_MEMINFO_VARS]metrics.Gauge{
 				metrics.GetOrRegisterGauge(fmt.Sprintf("udp.%d.rmem_alloc", i), nil),
 				metrics.GetOrRegisterGauge(fmt.Sprintf("udp.%d.rcvbuf", i), nil),
 				metrics.GetOrRegisterGauge(fmt.Sprintf("udp.%d.wmem_alloc", i), nil),
@@ -285,8 +308,8 @@ func NewUDPStatsEmitter(udpConns []*Conn) func() {
 
 	return func() {
 		for i, gauges := range udpGauges {
-			if err := udpConns[i].getMemInfo(&meminfo); err == nil {
-				for j := 0; j < _SK_MEMINFO_VARS; j++ {
+			if err := udpConns[i].(*StdConn).getMemInfo(&meminfo); err == nil {
+				for j := 0; j < unix.SK_MEMINFO_VARS; j++ {
 					gauges[j].Update(int64(meminfo[j]))
 				}
 			}

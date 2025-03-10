@@ -1,21 +1,44 @@
 package udp
 
 import (
-	"github.com/slackhq/nebula/firewall"
-	"github.com/slackhq/nebula/header"
+	"net/netip"
+
+	"github.com/slackhq/nebula/config"
 )
 
 const MTU = 9001
 
 type EncReader func(
-	addr *Addr,
-	via interface{},
-	out []byte,
-	packet []byte,
-	header *header.H,
-	fwPacket *firewall.Packet,
-	lhh LightHouseHandlerFunc,
-	nb []byte,
-	q int,
-	localCache firewall.ConntrackCache,
+	addr netip.AddrPort,
+	payload []byte,
 )
+
+type Conn interface {
+	Rebind() error
+	LocalAddr() (netip.AddrPort, error)
+	ListenOut(r EncReader)
+	WriteTo(b []byte, addr netip.AddrPort) error
+	ReloadConfig(c *config.C)
+	Close() error
+}
+
+type NoopConn struct{}
+
+func (NoopConn) Rebind() error {
+	return nil
+}
+func (NoopConn) LocalAddr() (netip.AddrPort, error) {
+	return netip.AddrPort{}, nil
+}
+func (NoopConn) ListenOut(_ EncReader) {
+	return
+}
+func (NoopConn) WriteTo(_ []byte, _ netip.AddrPort) error {
+	return nil
+}
+func (NoopConn) ReloadConfig(_ *config.C) {
+	return
+}
+func (NoopConn) Close() error {
+	return nil
+}

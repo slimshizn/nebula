@@ -1,12 +1,12 @@
 package nebula
 
 import (
-	"net"
+	"net/netip"
 	"testing"
 	"time"
 
+	"github.com/slackhq/nebula/cert"
 	"github.com/slackhq/nebula/header"
-	"github.com/slackhq/nebula/iputil"
 	"github.com/slackhq/nebula/test"
 	"github.com/slackhq/nebula/udp"
 	"github.com/stretchr/testify/assert"
@@ -14,109 +14,59 @@ import (
 
 func Test_NewHandshakeManagerVpnIp(t *testing.T) {
 	l := test.NewLogger()
-	_, tuncidr, _ := net.ParseCIDR("172.1.1.1/24")
-	_, vpncidr, _ := net.ParseCIDR("172.1.1.1/24")
-	_, localrange, _ := net.ParseCIDR("10.1.1.1/24")
-	ip := iputil.Ip2VpnIp(net.ParseIP("172.1.1.2"))
-	preferredRanges := []*net.IPNet{localrange}
-	mw := &mockEncWriter{}
-	mainHM := NewHostMap(l, "test", vpncidr, preferredRanges)
-	lh := &LightHouse{
-		atomicStaticList:  make(map[iputil.VpnIp]struct{}),
-		atomicLighthouses: make(map[iputil.VpnIp]struct{}),
-		addrMap:           make(map[iputil.VpnIp]*RemoteList),
+	localrange := netip.MustParsePrefix("10.1.1.1/24")
+	ip := netip.MustParseAddr("172.1.1.2")
+
+	preferredRanges := []netip.Prefix{localrange}
+	mainHM := newHostMap(l)
+	mainHM.preferredRanges.Store(&preferredRanges)
+
+	lh := newTestLighthouse()
+
+	cs := &CertState{
+		defaultVersion:   cert.Version1,
+		privateKey:       []byte{},
+		v1Cert:           &dummyCert{version: cert.Version1},
+		v1HandshakeBytes: []byte{},
 	}
 
-	blah := NewHandshakeManager(l, tuncidr, preferredRanges, mainHM, lh, &udp.Conn{}, defaultHandshakeConfig)
+	blah := NewHandshakeManager(l, mainHM, lh, &udp.NoopConn{}, defaultHandshakeConfig)
+	blah.f = &Interface{handshakeManager: blah, pki: &PKI{}, l: l}
+	blah.f.pki.cs.Store(cs)
 
 	now := time.Now()
-	blah.NextOutboundHandshakeTimerTick(now, mw)
+	blah.NextOutboundHandshakeTimerTick(now)
 
-	var initCalled bool
-	initFunc := func(*HostInfo) {
-		initCalled = true
-	}
-
-	i := blah.AddVpnIp(ip, initFunc)
-	assert.True(t, initCalled)
-
-	initCalled = false
-	i2 := blah.AddVpnIp(ip, initFunc)
-	assert.False(t, initCalled)
+	i := blah.StartHandshake(ip, nil)
+	i2 := blah.StartHandshake(ip, nil)
 	assert.Same(t, i, i2)
 
-	i.remotes = NewRemoteList()
-	i.HandshakeReady = true
+	i.remotes = NewRemoteList([]netip.Addr{}, nil)
 
 	// Adding something to pending should not affect the main hostmap
-	assert.Len(t, mainHM.Hosts, 0)
+	assert.Empty(t, mainHM.Hosts)
 
 	// Confirm they are in the pending index list
-	assert.Contains(t, blah.pendingHostMap.Hosts, ip)
+	assert.Contains(t, blah.vpnIps, ip)
 
 	// Jump ahead `HandshakeRetries` ticks, offset by one to get the sleep logic right
 	for i := 1; i <= DefaultHandshakeRetries+1; i++ {
 		now = now.Add(time.Duration(i) * DefaultHandshakeTryInterval)
-		blah.NextOutboundHandshakeTimerTick(now, mw)
+		blah.NextOutboundHandshakeTimerTick(now)
 	}
 
 	// Confirm they are still in the pending index list
-	assert.Contains(t, blah.pendingHostMap.Hosts, ip)
+	assert.Contains(t, blah.vpnIps, ip)
 
 	// Tick 1 more time, a minute will certainly flush it out
-	blah.NextOutboundHandshakeTimerTick(now.Add(time.Minute), mw)
+	blah.NextOutboundHandshakeTimerTick(now.Add(time.Minute))
 
 	// Confirm they have been removed
-	assert.NotContains(t, blah.pendingHostMap.Hosts, ip)
+	assert.NotContains(t, blah.vpnIps, ip)
 }
 
-func Test_NewHandshakeManagerTrigger(t *testing.T) {
-	l := test.NewLogger()
-	_, tuncidr, _ := net.ParseCIDR("172.1.1.1/24")
-	_, vpncidr, _ := net.ParseCIDR("172.1.1.1/24")
-	_, localrange, _ := net.ParseCIDR("10.1.1.1/24")
-	ip := iputil.Ip2VpnIp(net.ParseIP("172.1.1.2"))
-	preferredRanges := []*net.IPNet{localrange}
-	mw := &mockEncWriter{}
-	mainHM := NewHostMap(l, "test", vpncidr, preferredRanges)
-	lh := &LightHouse{
-		addrMap:           make(map[iputil.VpnIp]*RemoteList),
-		l:                 l,
-		atomicStaticList:  make(map[iputil.VpnIp]struct{}),
-		atomicLighthouses: make(map[iputil.VpnIp]struct{}),
-	}
-
-	blah := NewHandshakeManager(l, tuncidr, preferredRanges, mainHM, lh, &udp.Conn{}, defaultHandshakeConfig)
-
-	now := time.Now()
-	blah.NextOutboundHandshakeTimerTick(now, mw)
-
-	assert.Equal(t, 0, testCountTimerWheelEntries(blah.OutboundHandshakeTimer))
-
-	hi := blah.AddVpnIp(ip, nil)
-	hi.HandshakeReady = true
-	assert.Equal(t, 1, testCountTimerWheelEntries(blah.OutboundHandshakeTimer))
-	assert.Equal(t, 0, hi.HandshakeCounter, "Should not have attempted a handshake yet")
-
-	// Trigger the same method the channel will but, this should set our remotes pointer
-	blah.handleOutbound(ip, mw, true)
-	assert.Equal(t, 1, hi.HandshakeCounter, "Trigger should have done a handshake attempt")
-	assert.NotNil(t, hi.remotes, "Manager should have set my remotes pointer")
-
-	// Make sure the trigger doesn't double schedule the timer entry
-	assert.Equal(t, 1, testCountTimerWheelEntries(blah.OutboundHandshakeTimer))
-
-	uaddr := udp.NewAddrFromString("10.1.1.1:4242")
-	hi.remotes.unlockedPrependV4(ip, NewIp4AndPort(uaddr.IP, uint32(uaddr.Port)))
-
-	// We now have remotes but only the first trigger should have pushed things forward
-	blah.handleOutbound(ip, mw, true)
-	assert.Equal(t, 1, hi.HandshakeCounter, "Trigger should have not done a handshake attempt")
-	assert.Equal(t, 1, testCountTimerWheelEntries(blah.OutboundHandshakeTimer))
-}
-
-func testCountTimerWheelEntries(tw *SystemTimerWheel) (c int) {
-	for _, i := range tw.wheel {
+func testCountTimerWheelEntries(tw *LockingTimerWheel[netip.Addr]) (c int) {
+	for _, i := range tw.t.wheel {
 		n := i.Head
 		for n != nil {
 			c++
@@ -129,12 +79,24 @@ func testCountTimerWheelEntries(tw *SystemTimerWheel) (c int) {
 type mockEncWriter struct {
 }
 
-func (mw *mockEncWriter) SendMessageToVpnIp(t header.MessageType, st header.MessageSubType, vpnIp iputil.VpnIp, p, nb, out []byte) {
+func (mw *mockEncWriter) SendMessageToVpnAddr(_ header.MessageType, _ header.MessageSubType, _ netip.Addr, _, _, _ []byte) {
 	return
 }
 
-func (mw *mockEncWriter) SendVia(via interface{}, relay interface{}, ad, nb, out []byte, nocopy bool) {
+func (mw *mockEncWriter) SendVia(_ *HostInfo, _ *Relay, _, _, _ []byte, _ bool) {
 	return
 }
 
-func (mw *mockEncWriter) Handshake(vpnIP iputil.VpnIp) {}
+func (mw *mockEncWriter) SendMessageToHostInfo(_ header.MessageType, _ header.MessageSubType, _ *HostInfo, _, _, _ []byte) {
+	return
+}
+
+func (mw *mockEncWriter) Handshake(_ netip.Addr) {}
+
+func (mw *mockEncWriter) GetHostInfo(_ netip.Addr) *HostInfo {
+	return nil
+}
+
+func (mw *mockEncWriter) GetCertState() *CertState {
+	return &CertState{defaultVersion: cert.Version2}
+}

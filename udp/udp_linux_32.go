@@ -30,7 +30,7 @@ type rawMessage struct {
 	Len uint32
 }
 
-func (u *Conn) PrepareRawMessages(n int) ([]rawMessage, [][]byte, [][]byte) {
+func (u *StdConn) PrepareRawMessages(n int) ([]rawMessage, [][]byte, [][]byte) {
 	msgs := make([]rawMessage, n)
 	buffers := make([][]byte, n)
 	names := make([][]byte, n)
@@ -39,7 +39,6 @@ func (u *Conn) PrepareRawMessages(n int) ([]rawMessage, [][]byte, [][]byte) {
 		buffers[i] = make([]byte, MTU)
 		names[i] = make([]byte, unix.SizeofSockaddrInet6)
 
-		//TODO: this is still silly, no need for an array
 		vs := []iovec{
 			{Base: &buffers[i][0], Len: uint32(len(buffers[i]))},
 		}

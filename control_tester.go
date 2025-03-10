@@ -4,22 +4,21 @@
 package nebula
 
 import (
-	"net"
+	"net/netip"
 
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
 	"github.com/slackhq/nebula/header"
-	"github.com/slackhq/nebula/iputil"
 	"github.com/slackhq/nebula/overlay"
 	"github.com/slackhq/nebula/udp"
 )
 
-// WaitForTypeByIndex will pipe all messages from this control device into the pipeTo control device
+// WaitForType will pipe all messages from this control device into the pipeTo control device
 // returning after a message matching the criteria has been piped
 func (c *Control) WaitForType(msgType header.MessageType, subType header.MessageSubType, pipeTo *Control) {
 	h := &header.H{}
 	for {
-		p := c.f.outside.Get(true)
+		p := c.f.outside.(*udp.TesterConn).Get(true)
 		if err := h.Parse(p.Data); err != nil {
 			panic(err)
 		}
@@ -35,7 +34,7 @@ func (c *Control) WaitForType(msgType header.MessageType, subType header.Message
 func (c *Control) WaitForTypeByIndex(toIndex uint32, msgType header.MessageType, subType header.MessageSubType, pipeTo *Control) {
 	h := &header.H{}
 	for {
-		p := c.f.outside.Get(true)
+		p := c.f.outside.(*udp.TesterConn).Get(true)
 		if err := h.Parse(p.Data); err != nil {
 			panic(err)
 		}
@@ -48,37 +47,30 @@ func (c *Control) WaitForTypeByIndex(toIndex uint32, msgType header.MessageType,
 
 // InjectLightHouseAddr will push toAddr into the local lighthouse cache for the vpnIp
 // This is necessary if you did not configure static hosts or are not running a lighthouse
-func (c *Control) InjectLightHouseAddr(vpnIp net.IP, toAddr *net.UDPAddr) {
+func (c *Control) InjectLightHouseAddr(vpnIp netip.Addr, toAddr netip.AddrPort) {
 	c.f.lightHouse.Lock()
-	remoteList := c.f.lightHouse.unlockedGetRemoteList(iputil.Ip2VpnIp(vpnIp))
+	remoteList := c.f.lightHouse.unlockedGetRemoteList([]netip.Addr{vpnIp})
 	remoteList.Lock()
 	defer remoteList.Unlock()
 	c.f.lightHouse.Unlock()
 
-	iVpnIp := iputil.Ip2VpnIp(vpnIp)
-	if v4 := toAddr.IP.To4(); v4 != nil {
-		remoteList.unlockedPrependV4(iVpnIp, NewIp4AndPort(v4, uint32(toAddr.Port)))
+	if toAddr.Addr().Is4() {
+		remoteList.unlockedPrependV4(vpnIp, netAddrToProtoV4AddrPort(toAddr.Addr(), toAddr.Port()))
 	} else {
-		remoteList.unlockedPrependV6(iVpnIp, NewIp6AndPort(toAddr.IP, uint32(toAddr.Port)))
+		remoteList.unlockedPrependV6(vpnIp, netAddrToProtoV6AddrPort(toAddr.Addr(), toAddr.Port()))
 	}
 }
 
 // InjectRelays will push relayVpnIps into the local lighthouse cache for the vpnIp
 // This is necessary to inform an initiator of possible relays for communicating with a responder
-func (c *Control) InjectRelays(vpnIp net.IP, relayVpnIps []net.IP) {
+func (c *Control) InjectRelays(vpnIp netip.Addr, relayVpnIps []netip.Addr) {
 	c.f.lightHouse.Lock()
-	remoteList := c.f.lightHouse.unlockedGetRemoteList(iputil.Ip2VpnIp(vpnIp))
+	remoteList := c.f.lightHouse.unlockedGetRemoteList([]netip.Addr{vpnIp})
 	remoteList.Lock()
 	defer remoteList.Unlock()
 	c.f.lightHouse.Unlock()
 
-	iVpnIp := iputil.Ip2VpnIp(vpnIp)
-	uVpnIp := []uint32{}
-	for _, rVPnIp := range relayVpnIps {
-		uVpnIp = append(uVpnIp, uint32(iputil.Ip2VpnIp(rVPnIp)))
-	}
-
-	remoteList.unlockedSetRelay(iVpnIp, iVpnIp, uVpnIp)
+	remoteList.unlockedSetRelay(vpnIp, relayVpnIps)
 }
 
 // GetFromTun will pull a packet off the tun side of nebula
@@ -88,11 +80,11 @@ func (c *Control) GetFromTun(block bool) []byte {
 
 // GetFromUDP will pull a udp packet off the udp side of nebula
 func (c *Control) GetFromUDP(block bool) *udp.Packet {
-	return c.f.outside.Get(block)
+	return c.f.outside.(*udp.TesterConn).Get(block)
 }
 
 func (c *Control) GetUDPTxChan() <-chan *udp.Packet {
-	return c.f.outside.TxPackets
+	return c.f.outside.(*udp.TesterConn).TxPackets
 }
 
 func (c *Control) GetTunTxChan() <-chan []byte {
@@ -101,24 +93,46 @@ func (c *Control) GetTunTxChan() <-chan []byte {
 
 // InjectUDPPacket will inject a packet into the udp side of nebula
 func (c *Control) InjectUDPPacket(p *udp.Packet) {
-	c.f.outside.Send(p)
+	c.f.outside.(*udp.TesterConn).Send(p)
 }
 
 // InjectTunUDPPacket puts a udp packet on the tun interface. Using UDP here because it's a simpler protocol
-func (c *Control) InjectTunUDPPacket(toIp net.IP, toPort uint16, fromPort uint16, data []byte) {
-	ip := layers.IPv4{
-		Version:  4,
-		TTL:      64,
-		Protocol: layers.IPProtocolUDP,
-		SrcIP:    c.f.inside.Cidr().IP,
-		DstIP:    toIp,
+func (c *Control) InjectTunUDPPacket(toAddr netip.Addr, toPort uint16, fromAddr netip.Addr, fromPort uint16, data []byte) {
+	serialize := make([]gopacket.SerializableLayer, 0)
+	var netLayer gopacket.NetworkLayer
+	if toAddr.Is6() {
+		if !fromAddr.Is6() {
+			panic("Cant send ipv6 to ipv4")
+		}
+		ip := &layers.IPv6{
+			Version:    6,
+			NextHeader: layers.IPProtocolUDP,
+			SrcIP:      fromAddr.Unmap().AsSlice(),
+			DstIP:      toAddr.Unmap().AsSlice(),
+		}
+		serialize = append(serialize, ip)
+		netLayer = ip
+	} else {
+		if !fromAddr.Is4() {
+			panic("Cant send ipv4 to ipv6")
+		}
+
+		ip := &layers.IPv4{
+			Version:  4,
+			TTL:      64,
+			Protocol: layers.IPProtocolUDP,
+			SrcIP:    fromAddr.Unmap().AsSlice(),
+			DstIP:    toAddr.Unmap().AsSlice(),
+		}
+		serialize = append(serialize, ip)
+		netLayer = ip
 	}
 
 	udp := layers.UDP{
 		SrcPort: layers.UDPPort(fromPort),
 		DstPort: layers.UDPPort(toPort),
 	}
-	err := udp.SetNetworkLayerForChecksum(&ip)
+	err := udp.SetNetworkLayerForChecksum(netLayer)
 	if err != nil {
 		panic(err)
 	}
@@ -128,7 +142,9 @@ func (c *Control) InjectTunUDPPacket(toIp net.IP, toPort uint16, fromPort uint16
 		ComputeChecksums: true,
 		FixLengths:       true,
 	}
-	err = gopacket.SerializeLayers(buffer, opt, &ip, &udp, gopacket.Payload(data))
+
+	serialize = append(serialize, &udp, gopacket.Payload(data))
+	err = gopacket.SerializeLayers(buffer, opt, serialize...)
 	if err != nil {
 		panic(err)
 	}
@@ -136,20 +152,32 @@ func (c *Control) InjectTunUDPPacket(toIp net.IP, toPort uint16, fromPort uint16
 	c.f.inside.(*overlay.TestTun).Send(buffer.Bytes())
 }
 
-func (c *Control) GetVpnIp() iputil.VpnIp {
-	return c.f.myVpnIp
+func (c *Control) GetVpnAddrs() []netip.Addr {
+	return c.f.myVpnAddrs
 }
 
-func (c *Control) GetUDPAddr() string {
-	return c.f.outside.Addr.String()
+func (c *Control) GetUDPAddr() netip.AddrPort {
+	return c.f.outside.(*udp.TesterConn).Addr
 }
 
-func (c *Control) KillPendingTunnel(vpnIp net.IP) bool {
-	hostinfo, ok := c.f.handshakeManager.pendingHostMap.Hosts[iputil.Ip2VpnIp(vpnIp)]
-	if !ok {
+func (c *Control) KillPendingTunnel(vpnIp netip.Addr) bool {
+	hostinfo := c.f.handshakeManager.QueryVpnAddr(vpnIp)
+	if hostinfo == nil {
 		return false
 	}
 
-	c.f.handshakeManager.pendingHostMap.DeleteHostInfo(hostinfo)
+	c.f.handshakeManager.DeleteHostInfo(hostinfo)
 	return true
+}
+
+func (c *Control) GetHostmap() *HostMap {
+	return c.f.hostMap
+}
+
+func (c *Control) GetCertState() *CertState {
+	return c.f.pki.getCertState()
+}
+
+func (c *Control) ReHandshake(vpnIp netip.Addr) {
+	c.f.handshakeManager.StartHandshake(vpnIp, nil)
 }

@@ -7,8 +7,6 @@ import (
 	"github.com/slackhq/nebula/header"
 )
 
-//TODO: this can probably move into the header package
-
 type MessageMetrics struct {
 	rx [][]metrics.Counter
 	tx [][]metrics.Counter
@@ -84,6 +82,7 @@ func newLighthouseMetrics() *MessageMetrics {
 			NebulaMeta_HostQueryReply,
 			NebulaMeta_HostUpdateNotification,
 			NebulaMeta_HostPunchNotification,
+			NebulaMeta_HostUpdateNotificationAck,
 		}
 		for _, i := range used {
 			h[i] = []metrics.Counter{metrics.GetOrRegisterCounter(fmt.Sprintf("lighthouse.%s.%s", t, i.String()), nil)}
